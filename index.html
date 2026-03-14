@@ -9,6 +9,11 @@
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <!-- NoSleep.js -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/nosleep/0.12.0/NoSleep.min.js"></script>
+    <!-- MediaPipe -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
     <style>
         :root {
             --bg: #121212;
@@ -123,11 +128,12 @@
         }
 
         #video-preview {
-            width: 100px;
+            width: 150px;
             height: auto;
             border-radius: 8px;
             margin-top: 10px;
-            opacity: 0.5;
+            opacity: 0.8;
+            border: 2px solid var(--primary);
         }
 
         .reset-btn {
@@ -192,9 +198,8 @@
         <button id="btn-auto" onclick="toggleAuto()">AUTO MODE: OFF</button>
 
         <div class="video-container">
-            <video id="camera" autoplay playsinline muted class="hidden"></video>
-            <canvas id="canvas-diff" width="160" height="120" class="hidden"></canvas>
-            <canvas id="canvas-preview" width="160" height="120" class="video-preview"></canvas>
+            <video id="camera" autoplay playsinline muted class="hidden" width="320" height="240"></video>
+            <canvas id="canvas-preview" width="320" height="240" class="video-preview"></canvas>
         </div>
 
         <div id="debug-info"></div>
@@ -334,10 +339,22 @@
         const video = document.getElementById('camera');
         const canvasPreview = document.getElementById('canvas-preview');
         const ctxPreview = canvasPreview.getContext('2d');
-        const canvasDiff = document.getElementById('canvas-diff');
-        const ctxDiff = canvasDiff.getContext('2d');
 
-        let previousFrameData = null;
+        let prevLandmarks = null;
+        let isPoseReady = false;
+
+        const pose = new Pose({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+            }
+        });
+        pose.setOptions({
+            modelComplexity: 0,
+            smoothLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        pose.onResults(onPoseResults);
 
         async function toggleAuto() {
             isAuto = !isAuto;
@@ -376,9 +393,8 @@
         }
 
         function selectNewTarget() {
-            // フィボナッチ数 * 乗数 をしきい値とする（カメラ差分のスケールに合わせる）
-            // 全ピクセル差分の合計だと数千〜数万になるので大きな値を設定。
-            targetThreshold = selectRandomFibo() * 50000;
+            // MediaPipeのボーン移動量(0.0~1.0の正規化座標の差分計 * 1000)を基準にする
+            targetThreshold = selectRandomFibo() * 500;
             accumulation = 0;
             updateDebug();
         }
@@ -389,12 +405,14 @@
                 throw new Error("No camera support");
             }
             try {
+                // MediaPipeのため少し大きめの解像度
                 const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: 160, height: 120, facingMode: 'environment' }
+                    video: { width: 320, height: 240, facingMode: 'environment' }
                 });
                 video.srcObject = stream;
                 await video.play();
-                previousFrameData = null;
+                prevLandmarks = null;
+                isPoseReady = true;
             } catch (err) {
                 alert("カメラのアクセスに失敗しました: " + err);
                 throw err;
@@ -402,44 +420,57 @@
         }
 
         function stopCamera() {
+            isPoseReady = false;
             if (video && video.srcObject) {
                 video.srcObject.getTracks().forEach(track => track.stop());
                 video.srcObject = null;
             }
         }
 
-        function autoLoop() {
-            if (!isAuto) return;
+        function onPoseResults(results) {
+            ctxPreview.save();
+            ctxPreview.clearRect(0, 0, canvasPreview.width, canvasPreview.height);
+            ctxPreview.drawImage(results.image, 0, 0, canvasPreview.width, canvasPreview.height);
 
-            // 映像を解析してモーション（差分）を計算
-            if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                ctxPreview.drawImage(video, 0, 0, canvasPreview.width, canvasPreview.height);
-                const currentFrame = ctxPreview.getImageData(0, 0, canvasPreview.width, canvasPreview.height);
+            if (results.poseLandmarks) {
+                drawConnectors(ctxPreview, results.poseLandmarks, POSE_CONNECTIONS, { color: '#00FF00', lineWidth: 2 });
+                drawLandmarks(ctxPreview, results.poseLandmarks, { color: '#FF0000', lineWidth: 1, radius: 2 });
 
-                if (previousFrameData) {
+                if (prevLandmarks) {
                     let diffSum = 0;
-                    for (let i = 0; i < currentFrame.data.length; i += 4) { // RGBA
-                        // 輝度の差分近似としてRGBA合計の差
-                        const curR = currentFrame.data[i], curG = currentFrame.data[i + 1], curB = currentFrame.data[i + 2];
-                        const prevR = previousFrameData.data[i], prevG = previousFrameData.data[i + 1], prevB = previousFrameData.data[i + 2];
-
-                        let diff = Math.abs(curR - prevR) + Math.abs(curG - prevG) + Math.abs(curB - prevB);
-                        // ノイズキャンセリング（軽微な変化は無視）
-                        if (diff > 30) {
-                            diffSum += diff;
+                    for (let i = 0; i < results.poseLandmarks.length; i++) {
+                        const cur = results.poseLandmarks[i];
+                        const prev = prevLandmarks[i];
+                        // 信頼度が高い関節のみを計算に含める
+                        if (cur.visibility > 0.5 && prev.visibility > 0.5) {
+                            const dx = cur.x - prev.x;
+                            const dy = cur.y - prev.y;
+                            diffSum += Math.sqrt(dx * dx + dy * dy);
                         }
                     }
 
-                    accumulation += diffSum;
-
-                    if (accumulation >= targetThreshold) {
-                        fireShishiodoshi();
+                    // スケールを整数サイズに合わせる
+                    let scaledDiff = diffSum * 1000;
+                    if (scaledDiff > 2) { // わずかなブレをノイズキャンセル
+                        accumulation += scaledDiff;
+                        if (accumulation >= targetThreshold) {
+                            fireShishiodoshi();
+                        }
+                        updateDebug();
                     }
-
-                    updateDebug();
                 }
+                prevLandmarks = results.poseLandmarks;
+            } else {
+                prevLandmarks = null;
+            }
+            ctxPreview.restore();
+        }
 
-                previousFrameData = currentFrame;
+        async function autoLoop() {
+            if (!isAuto) return;
+
+            if (isPoseReady && video.readyState === video.HAVE_ENOUGH_DATA) {
+                await pose.send({ image: video });
             }
 
             autoLoopId = requestAnimationFrame(autoLoop);
@@ -475,7 +506,7 @@
         function updateDebug() {
             const di = document.getElementById('debug-info');
             di.innerHTML = `Accumulation: ${Math.floor(accumulation)} / ${targetThreshold}<br>
-            Next Fibo Base: ${targetThreshold / 50000}`;
+            Next Fibo Base: ${targetThreshold / 500}`;
         }
 
     </script>

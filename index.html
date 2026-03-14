@@ -394,7 +394,7 @@
 
         function selectNewTarget() {
             // MediaPipeのボーン移動量(0.0~1.0の正規化座標の差分計 * 1000)を基準にする
-            targetThreshold = selectRandomFibo() * 500;
+            targetThreshold = selectRandomFibo() * 250;
             accumulation = 0;
             updateDebug();
         }
@@ -506,7 +506,7 @@
         function updateDebug() {
             const di = document.getElementById('debug-info');
             di.innerHTML = `Accumulation: ${Math.floor(accumulation)} / ${targetThreshold}<br>
-            Next Fibo Base: ${targetThreshold / 500}`;
+            Next Fibo Base: ${targetThreshold / 250}`;
         }
 
     </script>
